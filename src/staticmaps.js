@@ -4,7 +4,9 @@ import find from 'lodash.find';
 import uniqBy from 'lodash.uniqby';
 import url from 'url';
 import chunk from 'lodash.chunk';
-
+import { createHash } from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import Image from './image';
 import IconMarker from './marker';
 import Polyline from './polyline';
@@ -16,7 +18,7 @@ import Bound from './bound';
 import asyncQueue from './helper/asyncQueue';
 import geoutils from './helper/geo';
 
-const LINE_RENDER_CHUNK_SIZE = 1000;
+const RENDER_CHUNK_SIZE = 1000;
 
 class StaticMaps {
   constructor(options = {}) {
@@ -29,7 +31,14 @@ class StaticMaps {
     this.padding = [this.paddingX, this.paddingY];
     this.tileUrl = 'tileUrl' in this.options ? this.options.tileUrl : 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
     this.tileSize = this.options.tileSize || 256;
-    this.subdomains = this.options.subdomains || [];
+
+    this.tileCacheFolder = this.options.tileCacheFolder || null;
+    this.tileCacheAutoPurge = typeof this.options.tileCacheAutoPurge !== 'undefined' ? 
+      this.options.tileCacheAutoPurge : true;
+    this.tileCacheLifetime = this.options.tileCacheLifetime || 86400;
+    this.tileCacheHits = 0;
+
+    this.tileSubdomains = this.options.tileSubdomains || this.options.subdomains || [];
     this.tileRequestTimeout = this.options.tileRequestTimeout;
     this.tileRequestHeader = this.options.tileRequestHeader;
     this.tileRequestLimit = Number.isFinite(this.options.tileRequestLimit)
@@ -120,7 +129,46 @@ class StaticMaps {
       this.drawBaselayer(),
       this.loadMarker(),
     ]);
+
+    // when a cache folder is configured and auto purge is enable
+    // clear cache in 10% of all executions
+    if (this.tileCacheFolder !== null 
+      && this.tileCacheAutoPurge === true
+      && Math.random() * 10 <= 1) {
+      this.clearCache();
+  }
+
     return this.drawFeatures();
+  }
+
+  getTileCacheHits() {
+    return this.tileCacheHits;
+  }
+
+  async clearCache() {
+    if (this.tileCacheFolder !== null) {
+      const now = new Date().getTime();
+
+      fs.readdir(this.tileCacheFolder, (err, files) => {
+        files.forEach((file, index) => {
+          fs.stat(path.join(this.tileCacheFolder, file), (err, stat) => {
+            if (err) {
+              return console.error(err);
+            }
+
+            const fileMTime = new Date(stat.mtime).getTime() + this.tileCacheLifetime * 1000;
+
+            if (now > fileMTime) {
+              return fs.unlink(path.join(this.tileCacheFolder, file), (err) => {
+                if (err) {
+                  return console.error(err);
+                }
+              });
+            }
+          });
+        });
+      });
+    }
   }
 
   /**
@@ -247,11 +295,17 @@ class StaticMaps {
         let tileY = (y + maxTile) % maxTile;
         if (this.reverseY) tileY = ((1 << this.zoom) - tileY) - 1;
 
-        let tileUrl = this.tileUrl.replace('{z}', this.zoom).replace('{x}', tileX).replace('{y}', tileY);
+        let tileUrl;
+        if (this.tileUrl.includes('{quadkey}')) {
+          const quadKey = geoutils.tileXYToQuadKey(tileX, tileY, this.zoom);
+          tileUrl = this.tileUrl.replace('{quadkey}', quadKey);
+        } else {
+          tileUrl = this.tileUrl.replace('{z}', this.zoom).replace('{x}', tileX).replace('{y}', tileY);
+        }
 
-        if (this.subdomains.length > 0) {
-          // replace subdomain with random domain from subdomains array
-          tileUrl = tileUrl.replace('{s}', this.subdomains[Math.floor(Math.random() * this.subdomains.length)]);
+        if (this.tileSubdomains.length > 0) {
+          // replace subdomain with random domain from tileSubdomains array
+          tileUrl = tileUrl.replace('{s}', this.tileSubdomains[Math.floor(Math.random() * this.tileSubdomains.length)]);
         }
 
         result.push({
@@ -270,101 +324,83 @@ class StaticMaps {
     return this.image.draw(tiles.filter((v) => v.success).map((v) => v.tile));
   }
 
+  async drawSVG(features, svgFunction) {
+    if (!features.length) return;
+
+    // Chunk for performance
+    const chunks = chunk(features, RENDER_CHUNK_SIZE);
+
+    const baseImage = sharp(this.image.image);
+    const imageMetadata = await baseImage.metadata();
+
+    const processedChunks = chunks.map((c) => {
+      const svg = `
+        <svg
+          width="${imageMetadata.width}px"
+          height="${imageMetadata.height}px"
+          version="1.1"
+          xmlns="http://www.w3.org/2000/svg">
+          ${c.map((f) => svgFunction(f)).join('\n')}
+        </svg>
+      `;
+      return { input: Buffer.from(svg), top: 0, left: 0 };
+    });
+
+    this.image.image = await baseImage
+      .composite(processedChunks)
+      .toBuffer();
+  }
+
   /**
    *  Render a circle to SVG
    */
-  renderCircle(circle, imageMetadata) {
+  circleToSVG(circle) {
     const latCenter = circle.coord[1];
     const radiusInPixel = geoutils.meterToPixel(circle.radius, this.zoom, latCenter);
     const x = this.xToPx(geoutils.lonToX(circle.coord[0], this.zoom));
     const y = this.yToPx(geoutils.latToY(circle.coord[1], this.zoom));
-    const svgPath = `
-            <svg
-              width="${imageMetadata.width}px"
-              height="${imageMetadata.height}"
-              version="1.1"
-              xmlns="http://www.w3.org/2000/svg">
-              <circle
-                cx="${x}"
-                cy="${y}"
-                r="${radiusInPixel}"
-                style="fill-rule: inherit;"
-                stroke="${circle.color}"
-                fill="${circle.fill}"
-                stroke-width="${circle.width}"
-                />
-            </svg>`;
-    return { input: Buffer.from(svgPath), top: 0, left: 0 };
-  }
-
-  /**
-   *  Draw circles to the basemap
-   */
-  async drawCircles() {
-    if (!this.circles.length) return true;
-    const baseImage = sharp(this.image.image);
-    const imageMetadata = await baseImage.metadata();
-
-    const mpSvgs = this.circles
-      .map((circle) => this.renderCircle(circle, imageMetadata));
-
-    this.image.image = await baseImage.composite(mpSvgs).toBuffer();
-
-    return true;
+    return `
+      <circle
+        cx="${x}"
+        cy="${y}"
+        r="${radiusInPixel}"
+        style="fill-rule: inherit;"
+        stroke="${circle.color}"
+        fill="${circle.fill}"
+        stroke-width="${circle.width}"
+        />
+    `;
   }
 
   /**
    * Render text to SVG
    */
-  renderText(text, imageMetadata) {
+  textToSVG(text) {
     const mapcoords = [
       this.xToPx(geoutils.lonToX(text.coord[0], this.zoom)) - text.offset[0],
       this.yToPx(geoutils.latToY(text.coord[1], this.zoom)) - text.offset[1],
     ];
 
-    const svgPath = `
-      <svg
-        width="${imageMetadata.width}px"
-        height="${imageMetadata.height}px"
-        version="1.1"
-        xmlns="http://www.w3.org/2000/svg">
-        <text
-          x="${mapcoords[0]}"
-          y="${mapcoords[1]}"
-          style="fill-rule: inherit; font-family: ${text.font};"
-          font-size="${text.size}pt"
-          stroke="${text.color}"
-          fill="${text.fill ? text.fill : 'none'}"
-          stroke-width="${text.width}"
-          text-anchor="${text.anchor}"
-        >
-            ${text.text}</text>
-      </svg>`;
-
-    return { input: Buffer.from(svgPath), top: 0, left: 0 };
-  }
-
-  /**
-   *  Draw texts to the baemap
-   */
-  async drawText() {
-    if (!this.text.length) return null;
-
-    const baseImage = sharp(this.image.image);
-    const imageMetadata = await baseImage.metadata();
-
-    const txtSvgs = this.text
-      .map((text) => this.renderText(text, imageMetadata));
-
-    this.image.image = await baseImage.composite(txtSvgs).toBuffer();
-
-    return true;
+    return `
+      <text
+        x="${mapcoords[0]}"
+        y="${mapcoords[1]}"
+        style="fill-rule: inherit; font-family: ${text.font};"
+        font-size="${text.size}pt"
+        stroke="${text.color}"
+        fill="${text.fill ? text.fill : 'none'}"
+        stroke-width="${text.width}"
+        text-anchor="${text.anchor}"
+      >
+          ${text.text}
+      </text>
+    `;
   }
 
   /**
    *  Render MultiPolygon to SVG
    */
-  multipolygonToPath(multipolygon) {
+  multiPolygonToSVG(multipolygon) {
     const shapeArrays = multipolygon.coords.map((shape) => shape.map((coord) => [
       this.xToPx(geoutils.lonToX(coord[0], this.zoom)),
       this.yToPx(geoutils.latToY(coord[1], this.zoom)),
@@ -391,89 +427,25 @@ class StaticMaps {
   }
 
   /**
-   *  Render MultiPolygon to SVG
-   */
-  renderMultiPolygon(multipolygon, imageMetadata) {
-    const svgPath = `
-            <svg
-              width="${imageMetadata.width}px"
-              height="${imageMetadata.height}"
-              version="1.1"
-              xmlns="http://www.w3.org/2000/svg">
-              ${this.multipolygonToPath(multipolygon)}
-            </svg>`;
-    return { input: Buffer.from(svgPath), top: 0, left: 0 };
-  }
-
-  /**
-   *  Draw Multipolygon to the basemap
-   */
-  async drawMultiPolygons() {
-    if (!this.multipolygons.length) return true;
-
-    const baseImage = sharp(this.image.image);
-    const imageMetadata = await baseImage.metadata();
-
-    const mpSvgs = this.multipolygons
-      .map((multipolygon) => this.renderMultiPolygon(multipolygon, imageMetadata));
-
-    this.image.image = await baseImage.composite(mpSvgs).toBuffer();
-
-    return true;
-  }
-
-  /**
    *  Render Polyline to SVG
    */
-  lineToSvg(line) {
+  lineToSVG(line) {
     const points = line.coords.map((coord) => [
       this.xToPx(geoutils.lonToX(coord[0], this.zoom)),
       this.yToPx(geoutils.latToY(coord[1], this.zoom)),
     ]);
     return `<${(line.type === 'polyline') ? 'polyline' : 'polygon'}
-                style="fill-rule: inherit;"
-                points="${points.join(' ')}"
-                stroke="${line.color}"
-                fill="${line.fill ? line.fill : 'none'}"
-                stroke-width="${line.width}"/>`;
-  }
-
-  /**
-   *  Render Polyline / Polygon to SVG
-   */
-  renderLine(lines, imageMetadata) {
-    const svgPath = `
-            <svg
-              width="${imageMetadata.width}px"
-              height="${imageMetadata.height}"
-              version="1.1"
-              xmlns="http://www.w3.org/2000/svg">
-              ${lines.map((line) => this.lineToSvg(line))}
-            </svg>`;
-    return { input: Buffer.from(svgPath), top: 0, left: 0 };
-  }
-
-  /**
-   *  Draw polylines / polygons to the basemap
-   */
-  async drawLines() {
-    if (!this.lines.length) return true;
-    const chunks = chunk(this.lines, LINE_RENDER_CHUNK_SIZE);
-    const baseImage = sharp(this.image.image);
-    const imageMetadata = await baseImage.metadata();
-    const processedChunks = chunks.map((c) => this.renderLine(c, imageMetadata));
-
-    this.image.image = await baseImage
-      .composite(processedChunks)
-      .toBuffer();
-
-    return true;
+              style="fill-rule: inherit;"
+              points="${points.join(' ')}"
+              stroke="${line.color}"
+              fill="${line.fill ? line.fill : 'none'}"
+              stroke-width="${line.width}"/>`;
   }
 
   /**
    *  Draw markers to the basemap
    */
-  drawMarker() {
+  drawMarkers() {
     const queue = [];
     this.markers.forEach((marker) => {
       queue.push(async () => {
@@ -503,11 +475,11 @@ class StaticMaps {
    *  Draw all features to the basemap
    */
   async drawFeatures() {
-    await this.drawLines();
-    await this.drawMultiPolygons();
-    await this.drawMarker();
-    await this.drawText();
-    await this.drawCircles();
+    await this.drawSVG(this.lines, (c) => this.lineToSVG(c));
+    await this.drawSVG(this.multipolygons, (c) => this.multiPolygonToSVG(c));
+    await this.drawMarkers();
+    await this.drawSVG(this.text, (c) => this.textToSVG(c));
+    await this.drawSVG(this.circles, (c) => this.circleToSVG(c));
   }
 
   /**
@@ -562,33 +534,101 @@ class StaticMaps {
   /**
    *  Fetching tile from endpoint
    */
-  getTile(data) {
-    return new Promise((resolve) => {
-      const options = {
-        url: data.url,
-        responseType: 'buffer',
-        resolveWithFullResponse: true,
-        headers: this.tileRequestHeader || {},
-        timeout: this.tileRequestTimeout,
+  async getTile(data) {
+    
+    const options = {
+      url: data.url,
+      responseType: 'buffer',
+      // resolveWithFullResponse: true,
+      headers: this.tileRequestHeader || {},
+      timeout: this.tileRequestTimeout,
+    };
+
+    try {
+      let cacheFile = null;
+
+      if (this.tileCacheFolder !== null) {
+        const cacheKey = createHash('sha256').update(data.url).digest('hex');
+        cacheFile = path.join(this.tileCacheFolder, cacheKey);
+
+        if (fs.existsSync(cacheFile)) {
+          const stats = fs.statSync(cacheFile);
+
+          const seconds = (new Date().getTime() - stats.mtime) / 1000;
+
+          // If TTL expire, delete file
+          if (seconds < this.tileCacheLifetime) {
+            let cacheData;
+            try {
+              cacheData = JSON.parse(fs.readFileSync(cacheFile));
+            } catch(e) {
+              try {
+                cacheData = JSON.parse(fs.readFileSync(cacheFile));
+              } catch(e) {}
+            }
+
+            if(cacheData && cacheData.length > 0) {
+              try {
+                cacheData = Buffer.from(cacheData, 'base64');
+
+                if(cacheData && cacheData.length > 0) {
+                  const responseContent = {
+                    success: true,
+                    tile: {
+                      url: data.url,
+                      box: data.box,
+                      body: cacheData,
+                    },
+                  };
+
+                  this.tileCacheHits++;
+
+                  return responseContent;
+                }
+              } catch (e) {}
+            }
+          }
+
+          fs.rmSync(cacheFile);
+        }
+      }
+
+      let res = await got.get(options);
+      const { body, headers } = res;      
+
+      const contentType = headers['content-type'];
+      if (!contentType.startsWith('image/')) throw new Error('Tiles server response with wrong data');
+
+      const responseContent = {
+        success: true,
+        tile: {
+          url: data.url,
+          box: data.box,
+          body,
+        },
       };
 
-      // const defaultAgent = `staticmaps@${pjson.version}`;
-      // options.headers['User-Agent'] = options.headers['User-Agent'] || defaultAgent;
-
-      got.get(options).then((res) => {
-        resolve({
-          success: true,
-          tile: {
-            url: data.url,
-            box: data.box,
-            body: res.body,
-          },
+      if (this.tileCacheFolder !== null) {
+        fs.writeFile(cacheFile, JSON.stringify(responseContent.tile.body.toString('base64')), (err) => {
+          if (err) {
+            console.error(err);
+          }
+          // file written successfully
         });
-      }).catch((error) => resolve({
+
+        if (typeof responseContent.tile.body === 'string') {
+          responseContent.tile.body = Buffer.from(responseContent.tile.body, 'base64');
+        }
+      }
+
+      return responseContent;
+
+    } catch (error) {
+      return {
         success: false,
         error,
-      }));
-    });
+      };
+    }
   }
 
   /**
